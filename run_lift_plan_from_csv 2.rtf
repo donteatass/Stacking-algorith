@@ -153,6 +153,12 @@ def compute_lift_plan_from_dict(\
     # themselves are shared and updated in place.\
     stacks = \{sid: sat_list.copy() for sid, sat_list in stacks.items()\}\
     stacks[5] = []  # final stack\
+    serial_to_stack: Dict[str, int] = \{\
+        sat['serial']: sid\
+        for sid, sat_list in stacks.items() if sid != 5\
+        for sat in sat_list\
+    \}\
+\
 \
     # Build a lookup for statuses so we can update statuses as we move\
     status_map: Dict[str, Dict[str, Any]] = \{\
@@ -191,6 +197,13 @@ def compute_lift_plan_from_dict(\
         # If the group is empty there is nothing to keep.\
         if not group['group']:\
             return True\
+        g_stack_id = group['stack_id']\
+        # Keep group if upcoming targets from this stack remain\
+        for future_serial in final_order[idx_order:]\
+            if future_serial in processed_serials:\
+                continue\
+            if serial_to_stack.get(future_serial) == g_stack_id:\
+                return False\
         # Identify the serial on the top of this group (first element).\
         top_serial = group['group'][0]['serial']\
         # If the top serial has already been processed, nothing to keep.\
