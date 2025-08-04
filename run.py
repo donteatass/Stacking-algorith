@@ -1,0 +1,84 @@
+from run_lift_plan_from_csv import (
+    load_stacks_from_csv,
+    select_best_order,
+    compute_lift_plan_from_dict,
+)
+import os
+
+
+# Paths to your CSV files on the desktop (adjust filenames as needed)
+file_paths = [
+    os.path.expanduser("~/Desktop/location1.csv"),
+    os.path.expanduser("~/Desktop/location2.csv"),
+    os.path.expanduser("~/Desktop/location3.csv"),
+    os.path.expanduser("~/Desktop/location4.csv"),
+]
+
+# Load stacks
+stacks = load_stacks_from_csv(file_paths)
+
+# Display initial data set
+print("Initial stacks (top to bottom):")
+for sid in sorted(stacks.keys()):
+    print(f"\nStack {sid}:")
+    for pos, sat in enumerate(stacks[sid], start=1):
+        print(
+            f" {pos:02}: {sat['serial']:<6} "
+            f"filled={sat['filled']:<5} interim={sat['interim']:<5} "
+            f"final={sat['final']:<5} issue={sat['issue']:<5}"
+        )
+
+# Select the satellites to move
+final_order = select_best_order(stacks, 28)
+
+# Compute the lift plan with both optimisations enabled
+operations = compute_lift_plan_from_dict(
+    stacks, final_order, optimize_final_group=True, multi_pick=True
+)
+
+# Final stack
+print("\nFinal stack (bottom to top):")
+for pos, serial in enumerate(final_order, start=1):
+    print(f" Pos {pos:02}: {serial}")
+
+# Summaries
+total_moves = len(operations)
+temp_moves = sum(
+    1 for op in operations if op["action"] in ("lift_to_temp", "return_from_temp")
+)
+physical_moves = sum(
+    1 for op in operations if op["action"] != "return_immediate"
+)
+
+print("\nSummary:")
+print(f" Total operations (all actions): {total_moves}")
+print(f" Movements involving the temporary location: {temp_moves}")
+print(f" Total physical lifts (excluding immediate returns): {physical_moves}")
+
+from_stack = lambda op: f"stack {op['from_stack']}" if "from_stack" in op else ""
+to_stack = lambda op: f"stack {op['to_stack']}" if "to_stack" in op else ""
+
+for idx, op in enumerate(operations, start=1):
+    action = op["action"]
+    if action == "lift_to_temp":
+        print(
+            f"Lift {op['count']} sats from stack {op['from_stack']} to temp: {op['serials']}"
+        )
+    elif action == "lift_final_group":
+        print(f"Lift final group from stack {op['from_stack']}: {op['serials']}")
+    elif action == "move_to_final":
+        print(
+            f"Move {op['serial']} from stack {op['from_stack']} to final stack"
+        )
+    elif action == "return_immediate":
+        print(
+            f"Return {op['count']} sats immediately to stack {op['to_stack']}: {op['serials']}"
+        )
+    elif action == "return_from_temp":
+        print(
+            f"Return {op['count']} sats from temp to stack {op['to_stack']}: {op['serials']}"
+        )
+# Optionally list each operation
+# for op in operations:
+#     print(op)
+
