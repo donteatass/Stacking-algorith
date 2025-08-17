@@ -186,53 +186,60 @@ class LiftPlannerV1P5:
         from each stack, in order. `flags` is a list of booleans of the same length
         as the total items picked: True indicates the corresponding item is a
         deliverable satellite that should go to DEST, False indicates it is a
-        blocker and should be stashed to TEMP. Items are assumed to be listed in
-        the same order they will be picked (first pick's top-to-bottom items
-        followed by subsequent picks).
+        blocker that may be offloaded back to a safe source stack or stashed to
+        TEMP. Items are assumed to be listed in the same order they will be
+        picked (first pick's top-to-bottom items followed by subsequent picks).
 
         The method first executes the specified picks, accumulating all items in
         the hand. It then processes the `flags` in reverse (LIFO order) and
-        issues the appropriate drops to the destination or temp stacks. All
+        issues the appropriate drops to the destination or other stacks. All
         drops of consecutive items of the same type are batched together to
         minimize the number of drop actions.
         """
-        # Perform the picks in sequence
+        # Perform the picks in sequence and track the origin stack for each item
         total = 0
+        origins: List['StackState'] = []
         for stack, count in picks:
             if count <= 0:
                 continue
-            # annotate pick as part of multi-stack sequence
             note = f"{note_prefix}: pick"
             self._pick(stack, count, note=note)
+            origins.extend([stack] * count)
             total += count
         # Validate that flags length matches number of items picked
         assert len(flags) == total, "Flags length must match total items picked"
-        # Build runs of identical flag values in reverse order (top of hand first)
+        # Build runs of identical flag values (deliverable vs blocker) in reverse order
+        # while also tracking the set of origin stacks for each run.
         run_type: Optional[bool] = None
         run_length = 0
-        runs: List[Tuple[bool, int]] = []
-        for f in reversed(flags):
+        run_origins: List['StackState'] = []
+        runs: List[Tuple[bool, int, List['StackState']]] = []
+        for f, origin in zip(reversed(flags), reversed(origins)):
             if run_type is None:
                 run_type = f
                 run_length = 1
+                run_origins = [origin]
             elif f == run_type:
                 run_length += 1
+                if origin not in run_origins:
+                    run_origins.append(origin)
             else:
-                runs.append((run_type, run_length))
+                runs.append((run_type, run_length, run_origins))
                 run_type = f
                 run_length = 1
+                run_origins = [origin]
         if run_type is not None:
-            runs.append((run_type, run_length))
-        # Drop each run: deliverables go to DEST, blockers to TEMP
-        for is_deliver, length in runs:
+            runs.append((run_type, run_length, run_origins))
+        # Drop each run: deliverables go to DEST, blockers are offloaded when possible
+        for is_deliver, length, origin_list in runs:
             if length <= 0:
                 continue
             if is_deliver:
                 note = f"{note_prefix}: deliver run"
                 self._drop(self.dest, length, note=note)
             else:
-                note = f"{note_prefix}: stash blockers"
-                self._drop(self.temp, length, note=note)
+                note_base = f"{note_prefix}: stash blockers"
+                self._drop_blockers_prefer_offload(origin_list, length, note_base=note_base)
 
     # --- Heuristics for temp returns ---
     def _score_offload_stack(self, stack: 'StackState', batch_size: int):
@@ -284,24 +291,24 @@ class LiftPlannerV1P5:
         space = stack.space_left()
         return (has_any * 100 + depth_pen * 5, -space, -len(stack.items))
 
-    def _choose_offload_stack(self, batch_size: int, exclude: Optional['StackState']=None) -> Optional['StackState']:
+    def _choose_offload_stack(self, batch_size: int, exclude: Optional[List['StackState']]=None) -> Optional['StackState']:
         """
-        Choose a source stack to offload a batch of blockers into.  The stack must be
+        Choose a source stack to offload a batch of blockers into. The stack must be
         able to accommodate the entire batch without exceeding its capacity, and
         cannot have a remaining target or (in Mode B) a cleared satellite at the
-        top.  Optionally exclude a specific stack (typically the origin) to avoid
-        burying the target we are trying to expose.
+        top. Optionally exclude a collection of stacks (typically the origin stacks) to avoid
+        burying targets we are trying to expose.
 
         Args:
             batch_size: Number of blockers to offload.
-            exclude: A stack to exclude from consideration.
+            exclude: A collection of stacks to exclude from consideration.
 
         Returns:
             The chosen StackState, or None if no valid offload site exists.
         """
         def allowed(s: 'StackState') -> bool:
-            # Exclude the specified stack
-            if exclude is not None and s is exclude:
+            # Exclude specified stacks
+            if exclude is not None and any(s is ex for ex in exclude):
                 return False
             # Cannot exceed capacity
             if len(s.items) + batch_size > s.cap:
@@ -313,6 +320,7 @@ class LiftPlannerV1P5:
             if self._mode_B_active and s.top() and s.top().cleared:
                 return False
             return True
+
         candidates = [s for s in self.sources if allowed(s)]
         if not candidates:
             return None
@@ -320,21 +328,22 @@ class LiftPlannerV1P5:
         candidates.sort(key=lambda s: self._score_offload_stack(s, batch_size))
         return candidates[0]
 
-    def _drop_blockers_prefer_offload(self, origin: 'StackState', run_len: int, note_base: str):
+    def _drop_blockers_prefer_offload(self, origin: Optional[List['StackState']], run_len: int, note_base: str):
         """
         Drop a run of blockers, preferring to offload directly onto a safe source stack
         rather than stashing in the temporary stack. If no single source stack can
         accept the entire run, fall back to the temporary stack.
 
         Args:
-            origin: The stack from which the blockers were picked. This stack is
+            origin: List of stacks from which the blockers were picked. These stacks are
                 excluded from consideration when selecting an offload stack.
             run_len: The number of blockers to drop.
             note_base: The base note used to annotate the drop action. The chosen
                 destination will be appended to this note.
         """
-        # Attempt to find a safe offload stack other than the origin.
-        offload = self._choose_offload_stack(run_len, exclude=origin)
+        origin_list = origin or []
+        # Attempt to find a safe offload stack other than the origin(s).
+        offload = self._choose_offload_stack(run_len, exclude=origin_list)
         if offload is not None:
             # Directly drop blockers to the selected offload stack.
             self._drop(offload, run_len, note=f"{note_base}: offload to {offload.name}")
@@ -516,7 +525,7 @@ class LiftPlannerV1P5:
                         self._drop(target, run_len, note=note)
                     else:
                         # Prefer to offload blockers directly to another safe stack or stash to TEMP
-                        self._drop_blockers_prefer_offload(stack, run_len, note_base="Blockers (one-pick multi-seg)")
+                        self._drop_blockers_prefer_offload([stack], run_len, note_base="Blockers (one-pick multi-seg)")
                 # Reset for the next run
                 run_type = flag
                 run_len = 1
@@ -536,7 +545,7 @@ class LiftPlannerV1P5:
                 self._drop(target, run_len, note=note)
             else:
                 # Prefer to offload blockers directly to another safe stack or stash to TEMP
-                self._drop_blockers_prefer_offload(stack, run_len, note_base="Blockers (one-pick multi-seg)")
+                    self._drop_blockers_prefer_offload([stack], run_len, note_base="Blockers (one-pick multi-seg)")
         # Attempt early TEMP return if appropriate
         self.maybe_early_temp_return()
         return True
@@ -674,7 +683,7 @@ class LiftPlannerV1P5:
                         self._drop(stack, blockers, note="Return blockers to stack (one-lift)")
                     else:
                         # Prefer to offload blockers directly to another safe stack or TEMP
-                        self._drop_blockers_prefer_offload(stack, blockers, note_base="Blockers (one-lift)")
+                        self._drop_blockers_prefer_offload([stack], blockers, note_base="Blockers (one-lift)")
                 # Attempt an early TEMP return if appropriate
                 self.maybe_early_temp_return()
                 return True
@@ -733,7 +742,7 @@ class LiftPlannerV1P5:
                 if s_pick is stack:
                     remaining -= k
             # Prefer to offload peeled blockers directly to another safe stack or TEMP
-            self._drop_blockers_prefer_offload(stack, total, note_base="Peeled blockers (batched)")
+            self._drop_blockers_prefer_offload([stack], total, note_base="Peeled blockers (batched)")
         # After peeling blockers completely, attempt to pick the next target(s).  If there is at
         # least one target at the top, pick and deliver it.  Otherwise, if the top is still a
         # blocker (possible when TEMP offloads have placed blockers back onto this stack), peel
