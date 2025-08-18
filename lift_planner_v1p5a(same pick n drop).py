@@ -285,14 +285,10 @@ class LiftPlannerV1P5:
             move_n = min(self.hand_capacity, len(self.temp.items), target_stack.space_left())
             if move_n == 0:
                 break
-            # When freeing TEMP space, we can only remove items from the top of the TEMP stack.
-            # Pop a batch of items (top-to-bottom) and extend the hand accordingly.  The
-            # orientation of the items will be preserved when they are dropped back onto
-            # the source stack via _drop.
-            batch = self.temp.pop_batch(move_n)
-            self.hand.extend(batch)
-            self._record("pick", self.temp.name, move_n, batch, note="Freeing TEMP space (early offload)")
-            # Drop onto the chosen stack
+            # Free space by moving a batch from TEMP to a safe source.  Use the unified
+            # _pick/_drop helpers so that the single-pick/single-drop contract is
+            # respected even during this maintenance operation.
+            self._pick(self.temp, move_n, note="Freeing TEMP space (early offload)")
             self._drop(target_stack, move_n, note="Return from TEMP to source (batched)")
 
     def maybe_early_temp_return(self):
@@ -316,15 +312,10 @@ class LiftPlannerV1P5:
                     best_stack = s
             if best_stack:
                 move_n = min(self.hand_capacity, len(self.temp.items), best_stack.space_left())
-                # Pop items from the top of TEMP.  We cannot physically access the bottom
-                # of the stack, so we always remove from the top.  The order returned is
-                # top-to-bottom.  When pushing back to the source stack via _drop, the
-                # orientation will be restored.
-                batch = self.temp.pop_batch(move_n)
-                # Extend the hand with the batch in the order returned.  _drop will
-                # internally reverse the order as needed.
-                self.hand.extend(batch)
-                self._record("pick", self.temp.name, move_n, batch, note="Proactive TEMP reduction")
+                # Move a batch from TEMP back to a source stack using unified pick/drop
+                # helpers.  This preserves ordering and satisfies the unified-mode
+                # requirement of one pick followed by one drop.
+                self._pick(self.temp, move_n, note="Proactive TEMP reduction")
                 self._drop(best_stack, move_n, note="Early temp return (reduces future costs)")
 
     # --- Utility helpers ---
