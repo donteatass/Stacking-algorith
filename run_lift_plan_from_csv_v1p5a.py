@@ -4,12 +4,25 @@ from pathlib import Path
 import pandas as pd
 from lift_planner_v1p5a import read_stack_csv, LiftPlannerV1P5, StackState
 
+
 def build_planner(csvs, lookahead, beam, early_temp):
-    sources = [read_stack_csv(Path(p), f"Source{i+1}") for i,p in enumerate(csvs)]
-    temp = StackState("Temp", [], cap=15)
+    sources = [read_stack_csv(Path(p), f"Source{i+1}") for i, p in enumerate(csvs)]
+    hand_cap = 7
+    temp_cap = hand_cap * len(sources)
+    temp = StackState("Temp", [], cap=temp_cap)
     dest = StackState("Dest", [], cap=10**9)
-    return LiftPlannerV1P5(sources, temp, dest, hand_capacity=7, temp_cap=15,
-                           lookahead_depth=lookahead, beam_width=beam, early_temp_threshold=early_temp)
+    if not early_temp:
+        early_temp = temp_cap
+    return LiftPlannerV1P5(
+        sources,
+        temp,
+        dest,
+        hand_capacity=hand_cap,
+        temp_cap=temp_cap,
+        lookahead_depth=lookahead,
+        beam_width=beam,
+        early_temp_threshold=early_temp,
+    )
 
 def main():
     ap = argparse.ArgumentParser(description="Lift plan v1p5: minimize picks via one-pick multi-segment behind blockers.")
@@ -21,7 +34,8 @@ def main():
     ap.add_argument("--count", type=int, default=28, help="Mode B: how many to deliver (default 28).")
     ap.add_argument("--lookahead", type=int, default=2, help="Lookahead depth (default 2).")
     ap.add_argument("--beam", type=int, default=3, help="Beam width (default 3).")
-    ap.add_argument("--early-temp", type=int, default=12, help="Early TEMP return threshold (default 12).")
+    ap.add_argument("--early-temp", type=int, default=0,
+                    help="Early TEMP return threshold (default: capacity of TEMP stack).")
     ap.add_argument("--out", default="plan_v1p5", help="Output prefix for CSV/JSON.")
     args = ap.parse_args()
 
