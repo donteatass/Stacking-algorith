@@ -453,7 +453,11 @@ class LiftPlannerV1P5:
        delivered = len([x for x in self.dest.items if x.cleared])
        dest_set = {x.sat for x in self.dest.items}
        available_cleared = sum(
-           1 for s in self.sources for sat in s.items
+           1 for stack in list(self.sources) + [self.temp]
+           for sat in stack.items
+           if sat.cleared and sat.sat not in dest_set
+       ) + sum(
+           1 for sat in self.hand
            if sat.cleared and sat.sat not in dest_set
        )
        target_goal = min(count, delivered + available_cleared)
@@ -794,7 +798,11 @@ class LiftPlannerV1P5:
            # Dynamic goal: don't exceed available cleared sats
            dest_set = {x.sat for x in self.dest.items}
            available_cleared = sum(
-               1 for s in self.sources for sat in s.items
+               1 for stack in list(self.sources) + [self.temp]
+               for sat in stack.items
+               if sat.cleared and sat.sat not in dest_set
+           ) + sum(
+               1 for sat in self.hand
                if sat.cleared and sat.sat not in dest_set
            )
            remaining = min(count - delivered, available_cleared)
@@ -841,17 +849,14 @@ class LiftPlannerV1P5:
            cost_candidates.sort(key=lambda x: (x[0], x[1]))
            best_cost = cost_candidates[0][0] if cost_candidates else float('inf')
 
-           # 3) Determine top-run cleared and decide whether to deliver or peel
+           # 3) Deliver any cleared satellites already exposed on top before peeling
            best_stack = None; best_run = 0
            for s in self.sources:
                run = self._contiguous_top_cleared(s)
                if run > best_run:
-                   best_run = run; best_stack = s
-           # Compute cost of delivering top-run cleared (one pick and one drop) per cleared
-           deliver_cost = (2 / best_run) if best_run > 0 else float('inf')
-
-           # 4) Decide: deliver top-run if cost is no worse than peeling; else peel
-           if best_run > 0 and deliver_cost <= best_cost:
+                   best_run = run
+                   best_stack = s
+           if best_run > 0:
                take = min(best_run, self.hand_capacity, remaining)
                self._pick(best_stack, take, note=f"Mode B unified: pick {take} cleared from top")
                self._drop(self.dest, take, note="Mode B unified: drop to DEST")
@@ -859,9 +864,15 @@ class LiftPlannerV1P5:
                self.maybe_early_temp_return()
                continue
 
-           # 5) Otherwise, peel blockers from the best candidate based on largest run
+           # 4) Otherwise, peel blockers from the best candidate based on largest run
            if not cost_candidates:
-               # No peel candidates and no deliverable top-run; end gracefully
+               # No peel candidates and no deliverable top-run.
+               # If cleared sats exist in TEMP, return them to a source and continue;
+               # otherwise end gracefully.
+               if any(sat.cleared and sat.sat not in dest_set for sat in self.temp.items):
+                   self.return_all_temp()
+                   delivered = len([x for x in self.dest.items if x.cleared])
+                   continue
                break
            stack, idx, run_len = cost_candidates[0][2]
            # Peel blockers only (no mixed pick), offload in one drop
