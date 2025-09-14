@@ -1,9 +1,9 @@
+
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Set, Any, Callable
 import pandas as pd
 import copy
 from pathlib import Path
-import math
 
 @dataclass
 class Sat:
@@ -119,14 +119,6 @@ class LiftPlannerV1P5:
             a.step = i
         return pd.DataFrame([{"step":a.step,"action":a.action,"location":a.location,"count":a.count,
                               "items_top_to_bottom":a.items_top_to_bottom,"note":a.note} for a in rows])
-
-    
-    def save_log_to_csv(self, path: Path, compact: bool = True) -> None:
-        """Write the action log to CSV. Uses compact format by default."""
-        df = self.get_log_dataframe_compact() if compact else self.get_log_dataframe()
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(path, index=False)
 
     def get_summary(self) -> Dict[str, Any]:
         """
@@ -352,14 +344,18 @@ class LiftPlannerV1P5:
         # If only one candidate, no need for complex heuristics
         if len(cands) == 1:
             return cands[0]
-        # --- Heuristic selection for Mode A with deeper run consideration ---
-        # Build candidate information: for each stack, compute the index of the first remaining
-        # target (first_idx), all contiguous segments of remaining targets (with their start
-        # positions), the length of the largest contiguous run, and the starting index of that run.
-        candidate_info = []  # tuples: (stack, first_idx, reachable, max_run_len, total_targets, segments_cnt, largest_start)
+        # --- Heuristic selection for Mode A ---
+        # Attempt to choose a candidate based on the size and grouping of remaining targets.
+        # For each candidate stack, compute the index of the first remaining target, whether
+        # it is reachable in one peel (idx <= hand_capacity), the number of contiguous
+        # segments of targets below that index, the length of the largest contiguous
+        # target run, and the total number of remaining targets below that index.  Prefer
+        # stacks with larger average run length (total_targets / segments_count) and longer
+        # contiguous runs when reachable.
+        candidate_info = []  # tuples: (stack, idx, reachable, max_run_len, total_targets, segments_cnt)
         rem = self._remaining_targets()
         for s in cands:
-            # Find the index of the first remaining target in this stack
+            # Find the first remaining target in this stack
             first_idx = None
             for idx, sat in enumerate(s.items):
                 if sat.sat in rem:
@@ -368,50 +364,63 @@ class LiftPlannerV1P5:
             if first_idx is None:
                 continue
             reachable = first_idx <= self.hand_capacity
-            # Compute contiguous segments of remaining targets along with their start offsets
+            # Compute contiguous segments of remaining targets starting from first_idx
             items_after = s.items[first_idx:]
             flags = [(item.sat in rem) for item in items_after]
-            segments: List[Tuple[int, int]] = []  # (start_offset, length)
+            segments = []
             i = 0
             while i < len(flags):
                 if flags[i]:
                     start = i
                     while i < len(flags) and flags[i]:
                         i += 1
-                    segments.append((start, i - start))
+                    segments.append(i - start)
                 else:
                     i += 1
             if segments:
-                # Choose the largest contiguous run; tie-break on shallowest start
-                segments.sort(key=lambda x: (-x[1], x[0]))
-                largest_start, max_run_len = segments[0]
-                total_targets = sum(l for _, l in segments)
+                max_run_len = max(segments)
+                total_targets = sum(segments)
                 segments_cnt = len(segments)
             else:
-                # Should not happen: no contiguous segments
-                largest_start, max_run_len = 0, 1
+                max_run_len = 1
                 total_targets = 1
                 segments_cnt = 1
-            candidate_info.append((s, first_idx, reachable, max_run_len, total_targets, segments_cnt, largest_start))
-        if not candidate_info:
-            # Fallback: use first candidate if none computed
-            return cands[0]
-        # Evaluate each candidate by an approximate cost to reach and deliver its largest run
-        # Compute depth to largest run: first_idx + largest_start
-        scored: List[Tuple[float, int, int, Tuple]] = []  # (cost, -max_run_len, first_idx, candidate)
-        for info in candidate_info:
-            stack_c, first_idx, reachable_c, max_run_len, total_targets, segments_cnt, largest_start = info
-            idx_large = first_idx + largest_start
-            # Cost to peel blockers and deliver largest run: 2 * (ceil(idx_large/hand) + ceil(max_run_len/hand)) / max_run_len
-            lifts_blockers = math.ceil(idx_large / self.hand_capacity)
-            lifts_goods = math.ceil(max_run_len / self.hand_capacity)
-            cost = (lifts_blockers + lifts_goods) * 2 / max_run_len
-            scored.append((cost, -max_run_len, first_idx, info))
-        # Sort candidates by cost, then by longer max_run_len, then by shallower first_idx
-        scored.sort(key=lambda x: (x[0], x[1], x[2]))
-        best_info = scored[0][3]
-        best_stack = best_info[0]
-        return best_stack
+            candidate_info.append((s, first_idx, reachable, max_run_len, total_targets, segments_cnt))
+        # Filter to reachable candidates
+        reachable_candidates = [c for c in candidate_info if c[2]]
+        if reachable_candidates:
+            # Sort by average run length (total_targets/segments_cnt), then by largest run,
+            # then by fewer segments, then by shallower depth.  Use negative values for
+            # descending sorts.
+            def _score(c):
+                _, idx0, _, max_run_len, total_targets, segments_cnt = c
+                avg_run = total_targets / segments_cnt if segments_cnt else total_targets
+                return (-avg_run, -max_run_len, segments_cnt, idx0)
+            reachable_candidates.sort(key=_score)
+            best_stack = reachable_candidates[0][0]
+            return best_stack
+        # --- Fallback to original beam search ---
+        # When no stack's first remaining target is reachable in one peel, use beam search
+        # to evaluate short sequences of extractions.  This logic is unchanged from the
+        # original implementation.
+        beams = [(0, self.clone(), [])]
+        for depth in range(self.lookahead_depth):
+            new_beams = []
+            for score, state, path in beams:
+                cands2 = state._candidate_stacks()
+                if not cands2:
+                    new_beams.append((score, state, path))
+                    continue
+                for c in cands2:
+                    # Simulate extracting from this candidate in the cloned state.
+                    sim, delta = state._simulate_extract_from_stack(c.name)
+                    new_beams.append((score + delta, sim, path + [c.name]))
+            new_beams.sort(key=lambda t: t[0])
+            beams = new_beams[:self.beam_width]
+        best_score, best_state, best_path = beams[0]
+        # Choose the first stack in the best path; if path is empty, default to first candidate
+        first_choice = best_path[0] if best_path else cands[0].name
+        return next(s for s in self.sources if s.name == first_choice)
 
     def _contiguous_top_remaining_targets(self, stack: 'StackState') -> int:
         if not self._is_remaining_target(stack.top()):
@@ -447,161 +456,15 @@ class LiftPlannerV1P5:
     # --- Core extraction step for Mode A ---
     # --- Modes ---
     def plan_mode_A(self):
-        """
-        Unified Mode A: deliver remaining target IDs using a deeper lookâahead similar
-        to Mode B.  When possible, deliver contiguous top runs of targets directly.
-        Otherwise, peel enough blockers (including intermediate targets) to expose
-        the largest contiguous run of remaining targets in any stack.  This
-        approach avoids repeatedly peeling shallow, fragmented target runs when a
-        deeper run yields a lower cost per target.  It preserves the unified
-        singleâpick/singleâdrop constraint used throughout the planner.
-        """
         if not self.target_ids:
             raise AssertionError("Mode A requires target_ids to be provided.")
-        # Verify that all targets exist in the source stacks
         all_ids = {sat.sat for s in self.sources for sat in s.items}
         missing = [t for t in self.target_ids if t not in all_ids]
         if missing:
             raise AssertionError(f"Targets not found in stacks: {missing}")
-        # Continue until all targets have been delivered to the destination
-        # Note: use a while loop rather than recursion to support deep lookâahead
-        while True:
-            remaining_targets = self._remaining_targets()
-            if not remaining_targets:
-                break
-            # Determine how many targets have been delivered so far
-            delivered = len({x.sat for x in self.dest.items if x.sat in self.target_ids})
-            remaining = len(self.target_ids) - delivered
-            if remaining <= 0:
-                break
-            # --- Step 1: Identify the best topârun of remaining targets across all stacks ---
-            best_top_run = 0
-            best_top_stack: Optional[StackState] = None
-            for s in self.sources:
-                # Skip stacks with no remaining targets
-                if not self._stack_has_any_remaining_target(s):
-                    continue
-                # Compute the length of the contiguous run of remaining targets at the top
-                run_len = self._contiguous_top_remaining_targets(s)
-                if run_len > best_top_run:
-                    best_top_run = run_len
-                    best_top_stack = s
-            # Compute the cost of delivering this top run.  If run is longer than
-            # the hand capacity, multiple lifts will be required.
-            if best_top_run > 0:
-                lifts_top = math.ceil(best_top_run / self.hand_capacity)
-                cost_top = 2 * lifts_top / best_top_run
-            else:
-                cost_top = float('inf')
-            # --- Step 2: Identify the largest contiguous runs of remaining targets within each stack ---
-            candidates_info: List[Tuple[StackState, int, int]] = []  # (stack, idx_large, run_len_large)
-            # Build a set of currently delivered items to avoid recounting in candidate selection
-            dest_set = {x.sat for x in self.dest.items}
-            rem_set = remaining_targets
-            for s in self.sources:
-                # Skip stacks with no remaining targets
-                if not self._stack_has_any_remaining_target(s):
-                    continue
-                # Build a boolean flag list for each item: True if it's a remaining target
-                flags = [(sat.sat in rem_set) for sat in s.items]
-                # Find the index of the first remaining target
-                try:
-                    first_idx = flags.index(True)
-                except ValueError:
-                    continue
-                # Consider only the sublist from the first target downward
-                items_after = flags[first_idx:]
-                # Identify all contiguous segments of True values and record their start offsets and lengths
-                segments: List[Tuple[int, int]] = []
-                i = 0
-                while i < len(items_after):
-                    if items_after[i]:
-                        start = i
-                        while i < len(items_after) and items_after[i]:
-                            i += 1
-                        segments.append((start, i - start))
-                    else:
-                        i += 1
-                if not segments:
-                    continue
-                # Choose the largest contiguous run; on tie, use the shallowest start
-                segments.sort(key=lambda x: (-x[1], x[0]))
-                largest_start, run_len_large = segments[0]
-                # Compute the absolute index of the start of this large run in the stack
-                idx_large = first_idx + largest_start
-                # We only consider peeling to reach runs that are not at the very top
-                if idx_large > 0:
-                    candidates_info.append((s, idx_large, run_len_large))
-            # If candidates exist, compute their cost per target for peeling and delivering
-            best_large_cost = float('inf')
-            best_cand: Optional[Tuple[StackState, int, int]] = None
-            if candidates_info:
-                # Compute approximate cost ratio for peeling blockers and delivering the largest run
-                cost_candidates: List[Tuple[float, int, Tuple[StackState, int, int]]] = []
-                for stack_c, idx_large, run_len_large in candidates_info:
-                    lifts_blockers = math.ceil(idx_large / self.hand_capacity)
-                    lifts_goods = math.ceil(run_len_large / self.hand_capacity)
-                    actions = 2 * (lifts_blockers + lifts_goods)
-                    cost = actions / run_len_large if run_len_large > 0 else float('inf')
-                    cost_candidates.append((cost, idx_large, (stack_c, idx_large, run_len_large)))
-                # Select candidate with lowest cost; break ties by shallower depth
-                cost_candidates.sort(key=lambda x: (x[0], x[1]))
-                best_large_cost, _, best_cand = cost_candidates[0]
-            # --- Step 3: Decide whether to deliver a topârun or peel to a deeper run ---
-            if best_top_run > 0 and cost_top <= best_large_cost:
-                # Deliver the contiguous top run of targets from the best stack
-                take = min(best_top_run, self.hand_capacity, remaining)
-                # Note: we use _pick and _drop directly to enforce unified single pick/drop
-                self._pick(best_top_stack, take, note=f"Mode A unified: pick {take} target(s) from top")
-                self._drop(self.dest, take, note=f"Mode A unified: deliver {take} target(s) to DEST")
-                # Update delivered count automatically via dest stack
-                self.maybe_early_temp_return()
-                continue
-            # Otherwise, peel blockers (and intermediate targets) to reach the large run
-            if best_cand is not None:
-                stack_c, idx_large, run_len_large = best_cand
-                # Determine how many blockers to peel: the depth of the large run
-                peel_n = idx_large
-                # Peel up to hand capacity or the full depth, whichever is smaller
-                chunk = min(self.hand_capacity, peel_n)
-                # Identify an offload destination for the peeled items
-                offload = self._choose_offload_stack(chunk, exclude=stack_c)
-                if offload is None:
-                    # No safe source available; use TEMP (expand it if needed)
-                    if self.temp.space_left() < chunk:
-                        self._ensure_temp_space(chunk)
-                    offload = self.temp
-                # Pick and offload blockers/targets from the chosen stack
-                self._pick(stack_c, chunk, note="Mode A unified: peel blockers")
-                self._drop(offload, chunk, note=f"Mode A unified: offload to {offload.name}")
-                self.maybe_early_temp_return()
-                continue
-                        # --- TEMP recovery path: if no source has remaining targets but TEMP does, deliver/unwind TEMP ---
-            if not self._candidate_stacks() and self._stack_has_any_remaining_target(self.temp):
-                temp_run = self._contiguous_top_remaining_targets(self.temp)
-                if temp_run > 0:
-                    take = min(temp_run, self.hand_capacity, remaining)
-                    self._pick(self.temp, take, note="Mode A unified: deliver from TEMP")
-                    self._drop(self.dest, take, note="Mode A unified: deliver from TEMP to DEST")
-                    self.maybe_early_temp_return()
-                    continue
-                if len(self.temp.items) > 0:
-                    offload_site = self._choose_offload_stack(min(self.hand_capacity, len(self.temp.items)))
-                    if offload_site is not None:
-                        move_n = min(self.hand_capacity, len(self.temp.items), offload_site.space_left())
-                        if move_n > 0:
-                            self._pick(self.temp, move_n, note="Unwind TEMP to recover candidates")
-                            self._drop(offload_site, move_n, note="Unwind TEMP (to enable Mode A candidates)")
-                            self.maybe_early_temp_return()
-                            continue
-# Fallback: no large run candidates and no top run; use the original heuristics
-            # Fall back to beam search when deeper lookâahead cannot find a candidate
-            if not self._remaining_targets():
-                break
-            # Use existing beam search heuristics for tough cases
+        while self._remaining_targets():
             stack = self._beam_choose_next_stack()
             self._extract_one_from_stack(stack)
-        # After all targets delivered, return items from TEMP to sources
         self.return_all_temp()
 
     def return_all_temp(self):
@@ -721,70 +584,99 @@ class LiftPlannerV1P5:
         delivered = len([x for x in self.dest.items if x.cleared])
         while delivered < count:
             remaining = count - delivered
-            # 1) Determine candidate stacks by analysing the largest contiguous cleared run in each stack
-            candidates_info: List[Tuple[StackState, int, int]] = []  # (stack, idx_large, run_len_large)
-            dest_set = {x.sat for x in self.dest.items}
-            for s in self.sources:
-                # Compute flags for cleared sats not yet delivered
-                flags = [(sat.cleared and sat.sat not in dest_set) for sat in s.items]
-                # Find all contiguous cleared segments and record their start indices and lengths
-                segments = []  # list of (start_idx, length)
-                i = 0
-                while i < len(flags):
-                    if flags[i]:
-                        start = i
-                        while i < len(flags) and flags[i]:
-                            i += 1
-                        segments.append((start, i - start))
-                    else:
-                        i += 1
-                if not segments:
-                    continue
-                # Choose the largest segment by length; if tie, pick the shallowest (smallest start)
-                segments.sort(key=lambda x: (-x[1], x[0]))
-                idx_large, run_len_large = segments[0]
-                # Only consider peeling if there is at least one blocker above the large run
-                if idx_large > 0:
-                    candidates_info.append((s, idx_large, run_len_large))
-            # If no candidates found, break
-            if not candidates_info:
-                break
-            # Compute approximate cost ratio for each candidate
-            cost_candidates: List[Tuple[float, int, Tuple]] = []
-            for cand in candidates_info:
-                stack_c, idx_large, run_len_large = cand
-                # Number of lifts needed to peel blockers above the large run
-                lifts_blockers = math.ceil(idx_large / self.hand_capacity)
-                # Number of lifts needed to deliver the large run
-                lifts_goods = math.ceil(run_len_large / self.hand_capacity)
-                actions = 2 * (lifts_blockers + lifts_goods)
-                cost = actions / run_len_large if run_len_large > 0 else float('inf')
-                cost_candidates.append((cost, idx_large, cand))
-            # Sort by cost then by shallower idx
-            cost_candidates.sort(key=lambda x: (x[0], x[1]))
-            best_cost = cost_candidates[0][0]
-            # Determine top-run cleared and decide whether to deliver or peel
+            # 1) Deliver top-run cleared if available
             best_stack = None; best_run = 0
             for s in self.sources:
                 run = self._contiguous_top_cleared(s)
                 if run > best_run:
                     best_run = run; best_stack = s
-            # Compute cost of delivering top-run cleared (one pick and one drop) per cleared
-            deliver_cost = (2 / best_run) if best_run > 0 else float('inf')
-            # Decide: deliver top-run if cost is no worse than peeling; else peel
-            if best_run > 0 and deliver_cost <= best_cost:
+            if best_stack and best_run > 0:
                 take = min(best_run, self.hand_capacity, remaining)
                 self._pick(best_stack, take, note=f"Mode B unified: pick {take} cleared from top")
                 self._drop(self.dest, take, note="Mode B unified: drop to DEST")
                 delivered += take
                 self.maybe_early_temp_return()
                 continue
-            # Otherwise, peel blockers from the best candidate based on largest run
-            best_c = cost_candidates[0][2]  # (stack, idx_large, run_len_large)
-            stack, idx_large, run_len_large = best_c
-            # Peel enough blockers to expose at least one part of the large run
-            peel_n = idx_large if idx_large > 0 else 1
-            chunk = min(self.hand_capacity, peel_n)
+            # 2) Otherwise peel blockers from the best candidate stack
+            # Determine which stacks contain at least one remaining cleared satellite that
+            # has not yet been delivered to DEST.  For each such stack, capture the
+            # depth of the first uncleared satellite (idx), whether that cleared run is
+            # reachable in a single peel (idx <= hand_capacity), the length of the
+            # largest contiguous block of cleared satellites beneath that index, the
+            # total number of cleared satellites beneath that index, and the number of
+            # contiguous cleared segments beneath that index.  These metrics are used to
+            # choose a candidate that minimizes the number of pick/drop cycles.  In
+            # particular, a stack with a larger contiguous block of cleared satellites
+            # (and therefore fewer clear/bad transitions) is preferred over a shallower
+            # stack with a fragmented cleared pattern.
+            candidates_info = []  # list of tuples: (stack, idx, reachable, max_run_len, total_clears, segments_cnt)
+            dest_set = {x.sat for x in self.dest.items}
+            for s in self.sources:
+                # Find the depth of the first uncleared satellite not yet delivered
+                for idx, sat in enumerate(s.items):
+                    if sat.cleared and sat.sat not in dest_set:
+                        # Determine whether we can peel away all blockers above this
+                        # cleared satellite in a single lift.  If idx > hand_capacity,
+                        # the run is not reachable in one go.
+                        reachable = idx <= self.hand_capacity
+                        # Analyse the pattern of cleared satellites beneath idx.  Treat
+                        # only satellites that are cleared and not yet delivered as
+                        # valid.  Compute contiguous cleared segments and their lengths.
+                        items_after = s.items[idx:]
+                        clears = [(item.cleared and item.sat not in dest_set) for item in items_after]
+                        segments = []  # lengths of contiguous cleared runs
+                        i = 0
+                        while i < len(clears):
+                            if clears[i]:
+                                start = i
+                                while i < len(clears) and clears[i]:
+                                    i += 1
+                                segments.append(i - start)
+                            else:
+                                i += 1
+                        if segments:
+                            max_run_len = max(segments)
+                            total_clears = sum(segments)
+                            segments_cnt = len(segments)
+                        else:
+                            # This should not occur because idx points to a cleared sat,
+                            # but guard defensively.
+                            max_run_len = 1
+                            total_clears = 1
+                            segments_cnt = 1
+                        candidates_info.append((s, idx, reachable, max_run_len, total_clears, segments_cnt))
+                        break
+            # If no candidates are found, nothing left to deliver
+            if not candidates_info:
+                break
+            # Prefer candidates that are reachable in a single peel; among those,
+            # choose the one with the largest contiguous run of cleared satellites.
+            # Ties are broken by total number of clears, then by fewer segments
+            # (fewer clear/bad transitions), and finally by shallower depth.
+            reachable_candidates = [c for c in candidates_info if c[2]]
+            if reachable_candidates:
+                # When reachable, prefer stacks that deliver more clears per segment.
+                # Compute an average cleared-run score for each candidate: total_clears divided
+                # by the number of contiguous cleared segments.  This favours fewer
+                # clear/bad transitions and emphasises larger groups of clears.  We then
+                # break ties by the length of the largest contiguous run, then by the
+                # segment count (fewer is better), and finally by the depth of the first
+                # cleared satellite.  A lower idx (shallower) still wins if other metrics
+                # are equal.
+                def _candidate_score(t):
+                    _, idx0, _, max_run_len, total_clears, segments_cnt = t
+                    # Avoid division by zero; segments_cnt should never be zero.
+                    avg_run = total_clears / segments_cnt if segments_cnt else total_clears
+                    # Return a tuple for sorting: higher avg_run and max_run_len are better.
+                    return (-avg_run, -max_run_len, segments_cnt, idx0)
+                reachable_candidates.sort(key=_candidate_score)
+                stack, idx = reachable_candidates[0][0], reachable_candidates[0][1]
+            else:
+                # Fallback: no reachable candidate in a single peel.  Fall back to
+                # original behaviour: pick the stack with the shallowest first cleared.
+                candidates_info.sort(key=lambda t: t[1])
+                stack, idx = candidates_info[0][0], candidates_info[0][1]
+            chunk = min(self.hand_capacity, idx if idx > 0 else 1)
             offload = self._choose_offload_stack(chunk, exclude=stack)
             if offload is None:
                 if self.temp.space_left() < chunk:
@@ -833,21 +725,3 @@ def read_stack_csv(path: Path, name: str) -> StackState:
     # that have more than 15 satellites in a location.
     cap_size = max(15, len(items))
     return StackState(name=name, items=items, cap=cap_size)
-
-
-def run_mode_A_with_failsafe_csv(planner: LiftPlannerV1P5, csv_path: Path, compact: bool = True) -> str:
-    """
-    Run Mode A planning and always emit a CSV of the moves seen so far, even if an exception occurs.
-    Returns a status string ("success" or the exception message).
-    """
-    try:
-        planner.plan_mode_A()
-        status = "success"
-    except Exception as e:
-        status = f"failure: {e}"
-    finally:
-        try:
-            planner.save_log_to_csv(csv_path, compact=compact)
-        except Exception as write_err:
-            status += f"; additionally failed to write CSV: {write_err}"
-    return status
