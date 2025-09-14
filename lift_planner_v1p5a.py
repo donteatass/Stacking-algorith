@@ -718,7 +718,10 @@ class LiftPlannerV1P5:
         Strategy: deliver top-run cleared when present; otherwise peel blockers from the stack
         with the shallowest next-cleared target, offloading to a safe source or TEMP.
         """
-        total_cleared = sum(1 for s in self.sources for sat in s.items if sat.cleared)
+        total_cleared = (
+            sum(1 for s in self.sources for sat in s.items if sat.cleared)
+            + sum(1 for sat in self.temp.items if sat.cleared)
+        )
         if total_cleared < count:
             raise ValueError("not enough cleared sats for a stack")
         self._mode_B_active = True
@@ -728,7 +731,7 @@ class LiftPlannerV1P5:
             # 1) Determine candidate stacks by analysing the largest contiguous cleared run in each stack
             candidates_info: List[Tuple[StackState, int, int]] = []  # (stack, idx_large, run_len_large)
             dest_set = {x.sat for x in self.dest.items}
-            for s in self.sources:
+            for s in self.sources + [self.temp]:
                 # Compute flags for cleared sats not yet delivered
                 flags = [(sat.cleared and sat.sat not in dest_set) for sat in s.items]
                 # Find all contiguous cleared segments and record their start indices and lengths
@@ -759,7 +762,7 @@ class LiftPlannerV1P5:
             if not candidates_info:
                 best_stack = None
                 best_run = 0
-                for s in self.sources:
+                for s in self.sources + [self.temp]:
                     run = self._contiguous_top_cleared(s)
                     if run > best_run:
                         best_run = run
@@ -788,7 +791,7 @@ class LiftPlannerV1P5:
             best_cost = cost_candidates[0][0]
             # Determine top-run cleared and decide whether to deliver or peel
             best_stack = None; best_run = 0
-            for s in self.sources:
+            for s in self.sources + [self.temp]:
                 run = self._contiguous_top_cleared(s)
                 if run > best_run:
                     best_run = run; best_stack = s
@@ -810,6 +813,8 @@ class LiftPlannerV1P5:
             chunk = min(self.hand_capacity, peel_n)
             offload = self._choose_offload_stack(chunk, exclude=stack)
             if offload is None:
+                if stack is self.temp:
+                    raise RuntimeError("Cannot offload blockers from TEMP: no available stack")
                 if self.temp.space_left() < chunk:
                     self._ensure_temp_space(chunk)
                 offload = self.temp
