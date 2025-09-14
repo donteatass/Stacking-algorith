@@ -855,3 +855,28 @@ def run_mode_A_with_failsafe_csv(planner: LiftPlannerV1P5, csv_path: Path, compa
         except Exception as write_err:
             status += f"; additionally failed to write CSV: {write_err}"
     return status
+
+
+def run_mode_B_with_failsafe_csv(planner: LiftPlannerV1P5, count: int, csv_path: Path, compact: bool = True) -> str:
+    """Run Mode B planning and always emit a CSV of the moves seen so far.
+
+    If an exception occurs during planning, the error message is appended to the
+    planner log so that it appears in the CSV output.  The function returns a
+    status string ("success" or the exception message).
+    """
+    try:
+        planner.plan_mode_B(count=count)
+        status = "success"
+    except Exception as e:
+        status = f"failure: {e}"
+        # Record the error in the planner log so the CSV captures it
+        try:
+            planner._record("error", "", 0, [], note=str(e))
+        except Exception:
+            pass
+    finally:
+        try:
+            planner.save_log_to_csv(csv_path, compact=compact)
+        except Exception as write_err:
+            status += f"; additionally failed to write CSV: {write_err}"
+    return status
