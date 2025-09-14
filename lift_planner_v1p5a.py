@@ -718,6 +718,9 @@ class LiftPlannerV1P5:
         Strategy: deliver top-run cleared when present; otherwise peel blockers from the stack
         with the shallowest next-cleared target, offloading to a safe source or TEMP.
         """
+        total_cleared = sum(1 for s in self.sources for sat in s.items if sat.cleared)
+        if total_cleared < count:
+            raise ValueError("not enough cleared sats for a stack")
         self._mode_B_active = True
         delivered = len([x for x in self.dest.items if x.cleared])
         while delivered < count:
