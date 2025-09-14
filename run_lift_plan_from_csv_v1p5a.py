@@ -27,43 +27,61 @@ def main():
 
     planner = build_planner(args.csv, args.lookahead, args.beam, args.early_temp)
 
-    targets = []
-    if args.mode == "A":
-        if not args.targets_json and not args.targets_csv:
-            ap.error("Mode A requires --targets-json or --targets-csv")
-        if args.targets_json:
-            with open(args.targets_json) as f:
-                targets = [str(x) for x in json.load(f)]
+    try:
+        targets = []
+        if args.mode == "A":
+            if not args.targets_json and not args.targets_csv:
+                ap.error("Mode A requires --targets-json or --targets-csv")
+            if args.targets_json:
+                with open(args.targets_json) as f:
+                    targets = [str(x) for x in json.load(f)]
+            else:
+                df = pd.read_csv(args.targets_csv)
+                cols = [c.strip().lower() for c in df.columns]
+                if "sat" not in cols:
+                    ap.error("targets CSV must have a 'sat' column")
+                if {"filled","interim","final","issue"}.issubset(cols) and args.verify_cleared:
+                    def as_bool(x): return str(x).strip().lower() in ("true","t","1","yes","y")
+                    df = df[df["filled"].apply(as_bool) & df["interim"].apply(as_bool) & df["final"].apply(as_bool) & ~df["issue"].apply(as_bool)]
+                targets = [str(s) for s in df["sat"].astype(str).tolist()]
+            planner.target_ids = set(targets)
+            planner.plan_mode_A()
         else:
-            import pandas as pd
-            df = pd.read_csv(args.targets_csv)
-            cols = [c.strip().lower() for c in df.columns]
-            if "sat" not in cols:
-                ap.error("targets CSV must have a 'sat' column")
-            if {"filled","interim","final","issue"}.issubset(cols) and args.verify_cleared:
-                def as_bool(x): return str(x).strip().lower() in ("true","t","1","yes","y")
-                df = df[df["filled"].apply(as_bool) & df["interim"].apply(as_bool) & df["final"].apply(as_bool) & ~df["issue"].apply(as_bool)]
-            targets = [str(s) for s in df["sat"].astype(str).tolist()]
-        planner.target_ids = set(targets)
-        planner.plan_mode_A()
-    else:
-        planner.plan_mode_B(count=args.count)
+            planner.plan_mode_B(count=args.count)
 
-    # Raw log
-    '''df = planner.get_log_dataframe()
-    df.to_csv(Path(f"{args.out}_actions.csv"), index=False)'''
+        # Raw log
+        '''df = planner.get_log_dataframe()
+        df.to_csv(Path(f"{args.out}_actions.csv"), index=False)'''
 
-    # Compact log
-    df2 = planner.get_log_dataframe_compact()
-    df2.to_csv(Path(f"{args.out}_actions_compact.csv"), index=False)
+        # Compact log
+        df2 = planner.get_log_dataframe_compact()
+        df2.to_csv(Path(f"{args.out}_actions_compact.csv"), index=False)
 
-    # Summary
-    # Note: json is already imported at module scope. Avoid re-importing it
-    # inside this function, which would create a local shadow and cause
-    # UnboundLocalError when referenced earlier in the function. Use the
-    # module-level json import instead.
-    with open(Path(f"{args.out}_summary.json"), "w") as f:
-        json.dump(planner.get_summary(), f, indent=2)
+        # Summary
+        # Note: json is already imported at module scope. Avoid re-importing it
+        # inside this function, which would create a local shadow and cause
+        # UnboundLocalError when referenced earlier in the function. Use the
+        # module-level json import instead.
+        with open(Path(f"{args.out}_summary.json"), "w") as f:
+            json.dump(planner.get_summary(), f, indent=2)
+
+    except Exception as e:
+        # On failure, capture the error in the expected CSV/JSON outputs
+        err = str(e)
+        err_df = pd.DataFrame([
+            {
+                "step": 0,
+                "action": "error",
+                "location": "",
+                "count": 0,
+                "items_top_to_bottom": [],
+                "note": err,
+            }
+        ])
+        err_df.to_csv(Path(f"{args.out}_actions_compact.csv"), index=False)
+        with open(Path(f"{args.out}_summary.json"), "w") as f:
+            json.dump({"error": err}, f, indent=2)
+        print(err)
 
 if __name__ == "__main__":
     main()
