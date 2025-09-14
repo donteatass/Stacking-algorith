@@ -750,8 +750,27 @@ class LiftPlannerV1P5:
                 # Only consider peeling if there is at least one blocker above the large run
                 if idx_large > 0:
                     candidates_info.append((s, idx_large, run_len_large))
-            # If no candidates found, break
+            # If no candidates found, attempt to deliver any top-run cleared sats.
+            # This situation arises when all remaining cleared satellites are already
+            # exposed at the top of the stacks. The previous logic would break out of
+            # the loop before delivering these sats, leaving the plan short of the
+            # requested count. Instead, deliver the available top-run cleared sats
+            # before deciding to terminate the loop.
             if not candidates_info:
+                best_stack = None
+                best_run = 0
+                for s in self.sources:
+                    run = self._contiguous_top_cleared(s)
+                    if run > best_run:
+                        best_run = run
+                        best_stack = s
+                if best_run > 0:
+                    take = min(best_run, self.hand_capacity, remaining)
+                    self._pick(best_stack, take, note="Mode B unified: pick cleared from top")
+                    self._drop(self.dest, take, note="Mode B unified: drop to DEST")
+                    delivered += take
+                    self.maybe_early_temp_return()
+                    continue
                 break
             # Compute approximate cost ratio for each candidate
             cost_candidates: List[Tuple[float, int, Tuple]] = []
