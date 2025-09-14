@@ -291,6 +291,17 @@ class LiftPlannerV1P5:
                            self._pick(cleared_tops[0], 1, note="Free stack by moving top cleared to DEST")
                            self._drop(self.dest, 1, note="Drop cleared top to DEST (Mode B)")
                            continue
+                   # As a last resort, offload TEMP items to any stack with space to avoid
+                   # premature termination.  This may bury a cleared satellite but allows
+                   # the planner to continue and eventually recover it.
+                   fallback = [s for s in self.sources if s.space_left() > 0]
+                   if fallback:
+                       target_stack = max(fallback, key=lambda s: s.space_left())
+                       move_n = min(self.hand_capacity, len(self.temp.items), target_stack.space_left())
+                       if move_n > 0:
+                           self._pick(self.temp, move_n, note="Forced TEMP offload (no safe stacks)")
+                           self._drop(target_stack, move_n, note="Forced return from TEMP")
+                           continue
                    # If even that fails, deadlock; no space can be freed
                    raise RuntimeError("Deadlock: no safe stacks and no top targets to clear.")
                # Clear a top target to make a safe stack
