@@ -220,10 +220,12 @@ class LiftPlannerV1P5:
    def _choose_offload_stack(self, batch_size: int, exclude: Optional['StackState']=None) -> Optional['StackState']:
        """
        Choose a source stack to offload a batch of blockers into.  The stack must be
-       able to accommodate the entire batch without exceeding its capacity, and
-       cannot have a remaining target or (in Mode B) a cleared satellite at the
-       top.  Optionally exclude a specific stack (typically the origin) to avoid
-       burying the target we are trying to expose.
+       able to accommodate the entire batch without exceeding its capacity and
+       cannot expose a remaining target at the top.  Additionally, avoid stacks
+       whose top is a cleared satellite or where the batch would bury an existing
+       cleared satellite under seven or more blockers.  Optionally exclude a
+       specific stack (typically the origin) to avoid burying the target we are
+       trying to expose.
 
        Args:
            batch_size: Number of blockers to offload.
@@ -242,8 +244,13 @@ class LiftPlannerV1P5:
            # Cannot drop onto a remaining target
            if self._is_remaining_target(s.top()):
                return False
-           # In Mode B, avoid dropping on cleared satellites
-           if self._mode_B_active and s.top() and s.top().cleared:
+           # Avoid dropping onto a stack whose top is a cleared satellite.
+           if s.top() and s.top().cleared:
+               return False
+           # If a cleared satellite exists deeper in this stack, ensure that
+           # adding this batch will not bury it under 7 or more blockers.
+           future_idx = next((i for i, sat in enumerate(s.items) if sat.cleared), None)
+           if future_idx is not None and future_idx + batch_size >= 7:
                return False
            return True
        candidates = [s for s in self.sources if allowed(s)]
@@ -257,13 +264,18 @@ class LiftPlannerV1P5:
        while self.temp.space_left() < needed:
            # Determine which source stacks can safely receive offloaded items.
            def safe_drop_target(s: 'StackState') -> bool:
-               # Cannot offload to full stacks or onto a remaining target. Mode B additionally
-               # avoids dropping on cleared satellites.
+               # Cannot offload to full stacks or onto a remaining target.
                if s.space_left() <= 0:
                    return False
                if self._is_remaining_target(s.top()):
                    return False
-               if self._mode_B_active and s.top() and s.top().cleared:
+               # Avoid dropping onto a top cleared sat
+               if s.top() and s.top().cleared:
+                   return False
+               # Ensure that adding a batch won't bury an existing cleared sat under >=7 blockers
+               max_n = min(self.hand_capacity, len(self.temp.items), s.space_left())
+               future_idx = next((i for i, sat in enumerate(s.items) if sat.cleared), None)
+               if future_idx is not None and future_idx + max_n >= 7:
                    return False
                return True
 
@@ -313,7 +325,6 @@ class LiftPlannerV1P5:
            for s in self.sources:
                if s.space_left() <= 0: continue
                if self._is_remaining_target(s.top()): continue
-               if self._mode_B_active and s.top() and s.top().cleared: continue
                score = self._score_offload_stack(s, min(self.hand_capacity, len(self.temp.items), s.space_left()))
                if best is None or score < best:
                    best = score
@@ -675,7 +686,6 @@ class LiftPlannerV1P5:
            for s in self.sources:
                if s.space_left() <= 0: continue
                if self._is_remaining_target(s.top()): continue
-               if self._mode_B_active and s.top() and s.top().cleared: continue
                score = self._score_offload_stack(s, min(self.hand_capacity, len(self.temp.items), s.space_left()))
                if best is None or score < best:
                    best = score; best_stack = s
@@ -683,14 +693,7 @@ class LiftPlannerV1P5:
                cand = [s for s in self.sources if s.space_left() > 0]
                if not cand:
                    raise RuntimeError("No space to return TEMP items at end.")
-               if self._mode_B_active:
-                   non_cleared_top = [s for s in cand if not (s.top() and s.top().cleared)]
-                   if non_cleared_top:
-                       best_stack = max(non_cleared_top, key=lambda s: s.space_left())
-                   else:
-                       best_stack = max(cand, key=lambda s: s.space_left())
-               else:
-                   best_stack = max(cand, key=lambda s: s.space_left())
+               best_stack = max(cand, key=lambda s: s.space_left())
            move_n = min(self.hand_capacity, len(self.temp.items), best_stack.space_left())
            self._pick(self.temp, move_n, note="Final cleanup: empty TEMP")
            self._drop(best_stack, move_n, note="Return TEMP to source")
@@ -737,8 +740,9 @@ class LiftPlannerV1P5:
            assert len(stack.items) + k <= stack.cap, f"Drop would exceed cap of {stack.name}"
            if stack is not self.temp and self._is_remaining_target(stack.top()):
                raise AssertionError(f"Cannot drop onto {stack.name}: top is a remaining target.")
-           if self._mode_B_active and stack is not self.temp and stack.top() and stack.top().cleared:
-               raise AssertionError(f"Cannot drop onto {stack.name}: top is a cleared sat (Mode B).")
+           # Mode B originally disallowed dropping onto stacks whose top item was a
+           # cleared satellite.  Removing this restriction keeps Mode B's behaviour
+           # aligned with Mode A and avoids extra cleanup lifts.
        stack.push_batch(batch_top_to_bottom)
        del self.hand[-k:]
        self._record("drop", stack.name, k, batch_top_to_bottom, note)
@@ -877,11 +881,14 @@ class LiftPlannerV1P5:
                    continue
                if len(s.items) + chunk > s.cap:
                    continue
-               # Avoid dropping onto top cleared (would force immediate re-peel)
-               if s.top() and s.top().cleared:
-                   continue
-               # Avoid stacks containing any cleared that we expect to lift
-               if any((sat.cleared and sat.sat in future_set) for sat in s.items):
+               # If this stack contains a cleared satellite we expect to lift later,
+               # allow offloading only when the total blockers above it (existing depth
+               # plus this offload chunk) stays below 7.  Otherwise skip this stack.
+               future_idx = next(
+                   (i for i, sat in enumerate(s.items) if sat.cleared and sat.sat in future_set),
+                   None,
+               )
+               if future_idx is not None and future_idx + chunk >= 7:
                    continue
                safe_candidates.append(s)
            offload = None
