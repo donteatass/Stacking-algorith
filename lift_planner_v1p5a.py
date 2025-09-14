@@ -453,11 +453,7 @@ class LiftPlannerV1P5:
        delivered = len([x for x in self.dest.items if x.cleared])
        dest_set = {x.sat for x in self.dest.items}
        available_cleared = sum(
-           1 for stack in list(self.sources) + [self.temp]
-           for sat in stack.items
-           if sat.cleared and sat.sat not in dest_set
-       ) + sum(
-           1 for sat in self.hand
+           1 for s in self.sources for sat in s.items
            if sat.cleared and sat.sat not in dest_set
        )
        target_goal = min(count, delivered + available_cleared)
@@ -798,11 +794,7 @@ class LiftPlannerV1P5:
            # Dynamic goal: don't exceed available cleared sats
            dest_set = {x.sat for x in self.dest.items}
            available_cleared = sum(
-               1 for stack in list(self.sources) + [self.temp]
-               for sat in stack.items
-               if sat.cleared and sat.sat not in dest_set
-           ) + sum(
-               1 for sat in self.hand
+               1 for s in self.sources for sat in s.items
                if sat.cleared and sat.sat not in dest_set
            )
            remaining = min(count - delivered, available_cleared)
@@ -869,13 +861,7 @@ class LiftPlannerV1P5:
 
            # 5) Otherwise, peel blockers from the best candidate based on largest run
            if not cost_candidates:
-               # No peel candidates and no deliverable top-run.
-               # If cleared sats exist in TEMP, return them to a source and continue;
-               # otherwise end gracefully.
-               if any(sat.cleared and sat.sat not in dest_set for sat in self.temp.items):
-                   self.return_all_temp()
-                   delivered = len([x for x in self.dest.items if x.cleared])
-                   continue
+               # No peel candidates and no deliverable top-run; end gracefully
                break
            stack, idx, run_len = cost_candidates[0][2]
            # Peel blockers only (no mixed pick), offload in one drop
