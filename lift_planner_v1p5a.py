@@ -174,60 +174,46 @@ class LiftPlannerV1P5:
     # --- Heuristics for temp returns ---
     def _score_offload_stack(self, stack: 'StackState', batch_size: int):
         """
-        Compute a score for offloading a batch of TEMP items to a given stack.  Lower scores
-        are better.  Penalize stacks that would require re-peeling soon by examining the depth
-        of the next remaining target.  If the next target is very close to the top (e.g.,
-        within a few items), avoid offloading to this stack so we don't immediately pick
-        these blockers again.  Return a large penalty when the stack cannot accommodate
-        the batch or when the depth is below a threshold.  Otherwise, prefer stacks with
-        more free space and deeper remaining targets.
+        Compute a score for offloading a batch of blockers to a source stack.  Lower
+        scores are better.  The score combines several heuristics:
+
+        * Burying a remaining target or cleared satellite near the surface incurs a
+          penalty proportional to how close it is to the top.
+        * Stacks with any remaining targets receive a base penalty so we avoid hiding
+          them when possible.
+        * Preference is given to stacks with more free space and shorter overall length.
         """
-        # If offloading would overflow the stack, forbid this candidate by returning huge
         if len(stack.items) + batch_size > stack.cap:
             return (10**9, 0, 0)
-        # Determine if this stack still contains any remaining target
+
         has_any = int(self._stack_has_any_remaining_target(stack))
-        # Find the depth (index) of the first remaining target in this stack
-        depth = None
+
         rem = self._remaining_targets()
+        depth = None
         for i, sat in enumerate(stack.items):
             if sat.sat in rem:
                 depth = i
                 break
-        # If the next target is very close to the top (depth is small), avoid offloading here.
-        # We use a threshold based on the hand capacity and batch_size: if the remaining target
-        # would be within the current offload batch or within a small constant (3) above it,
-        # we penalize heavily.  This helps prevent the situation where items are returned to
-        # this stack only to be peeled again immediately afterwards.
-        if depth is not None:
-            # Determine threshold: the number of items we plan to offload plus a small margin.
-            # Using min(batch_size, hand_capacity) ensures we only penalize when the target
-            # would be buried within or just below the offloaded run.
-            threshold = min(batch_size, self.hand_capacity)
-            # Add a small margin to catch cases where the target is only a few items below
-            # the offloaded region.  A margin of 2 provides a good balance between avoiding
-            # immediate re-peeling and still utilizing available stacks when necessary.
-            margin = 2
-            if depth < threshold + margin:
-                # Penalize extremely; this makes this stack a last resort for offloading
-                return (10**9, 0, 0)
-        # Compute a softer penalty based on depth; deeper targets are less likely to require
-        # immediate peeling, so they receive a smaller penalty.  If there is no remaining
-        # target in this stack, depth_pen is zero.
-        depth_pen = 0 if depth is None else max(0, 10 - depth)
-        # More space is better: we use negative space so that larger space yields a smaller
-        # overall score.  We also use negative stack size to break ties by preferring
-        # shorter stacks when space is equal.
+
+        threshold = min(batch_size, self.hand_capacity)
+        margin = 2
+        depth_pen = 0
+        if depth is not None and depth < threshold + margin:
+            depth_pen = 150 + (threshold + margin - depth) * 20
+        elif depth is not None:
+            depth_pen = max(0, 10 - depth)
+
+        cleared_pen = sum(1 for sat in stack.items[:batch_size] if sat.cleared) * 100
+
         space = stack.space_left()
-        return (has_any * 100 + depth_pen * 5, -space, -len(stack.items))
+        score_primary = has_any * 50 + depth_pen + cleared_pen
+        return (score_primary, -space, -len(stack.items))
 
     def _choose_offload_stack(self, batch_size: int, exclude: Optional['StackState']=None) -> Optional['StackState']:
         """
-        Choose a source stack to offload a batch of blockers into.  The stack must be
-        able to accommodate the entire batch without exceeding its capacity, and
-        cannot have a remaining target or (in Mode B) a cleared satellite near the
-        top.  Optionally exclude a specific stack (typically the origin) to avoid
-        burying the target we are trying to expose.
+        Choose an offload destination for a batch of blockers.  Candidate stacks include
+        all sources (subject to capacity and top-target checks) as well as TEMP when it
+        has sufficient space.  The stack with the lowest heuristic score is returned.
 
         Args:
             batch_size: Number of blockers to offload.
@@ -237,25 +223,27 @@ class LiftPlannerV1P5:
             The chosen StackState, or None if no valid offload site exists.
         """
         def allowed(s: 'StackState') -> bool:
-            # Exclude the specified stack
             if exclude is not None and s is exclude:
                 return False
-            # Cannot exceed capacity
             if len(s.items) + batch_size > s.cap:
                 return False
-            # Cannot drop onto a remaining target
             if self._is_remaining_target(s.top()):
                 return False
-            # In Mode B, avoid stacks that hide cleared sats near the surface
-            if self._mode_B_active and self._has_cleared_near_surface(s, max(batch_size, 1)):
-                return False
             return True
-        candidates = [s for s in self.sources if allowed(s)]
+
+        candidates: List[Tuple[Tuple[int, int, int], StackState]] = []
+        for s in self.sources:
+            if allowed(s):
+                candidates.append((self._score_offload_stack(s, batch_size), s))
+
+        if self.temp.space_left() >= batch_size:
+            candidates.append(((120, 0, 0), self.temp))
+
         if not candidates:
             return None
-        # Choose the candidate with the lowest score according to _score_offload_stack
-        candidates.sort(key=lambda s: self._score_offload_stack(s, batch_size))
-        return candidates[0]
+
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
 
     def _ensure_temp_space(self, needed: int):
         while self.temp.space_left() < needed:
@@ -676,8 +664,6 @@ class LiftPlannerV1P5:
             assert len(stack.items) + k <= stack.cap, f"Drop would exceed cap of {stack.name}"
             if stack is not self.temp and self._is_remaining_target(stack.top()):
                 raise AssertionError(f"Cannot drop onto {stack.name}: top is a remaining target.")
-            if self._mode_B_active and stack is not self.temp and stack.top() and stack.top().cleared:
-                raise AssertionError(f"Cannot drop onto {stack.name}: top is a cleared sat (Mode B).")
         stack.push_batch(batch_top_to_bottom)
         del self.hand[-k:]
         self._record("drop", stack.name, k, batch_top_to_bottom, note)
