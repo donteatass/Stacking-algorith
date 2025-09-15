@@ -168,6 +168,10 @@ class LiftPlannerV1P5:
         rem = self._remaining_targets()
         return any(s.sat in rem for s in stack.items)
 
+    def _has_cleared_near_surface(self, stack: 'StackState', depth: int) -> bool:
+        """Return True if any cleared sat occurs within the top `depth` items."""
+        return any(s.cleared for s in stack.items[:depth])
+
     # --- Heuristics for temp returns ---
     def _score_offload_stack(self, stack: 'StackState', batch_size: int):
         """
@@ -222,7 +226,7 @@ class LiftPlannerV1P5:
         """
         Choose a source stack to offload a batch of blockers into.  The stack must be
         able to accommodate the entire batch without exceeding its capacity, and
-        cannot have a remaining target or (in Mode B) a cleared satellite at the
+        cannot have a remaining target or (in Mode B) a cleared satellite near the
         top.  Optionally exclude a specific stack (typically the origin) to avoid
         burying the target we are trying to expose.
 
@@ -243,8 +247,8 @@ class LiftPlannerV1P5:
             # Cannot drop onto a remaining target
             if self._is_remaining_target(s.top()):
                 return False
-            # In Mode B, avoid dropping on cleared satellites
-            if self._mode_B_active and s.top() and s.top().cleared:
+            # In Mode B, avoid stacks that hide cleared sats near the surface
+            if self._mode_B_active and self._has_cleared_near_surface(s, max(batch_size, 1)):
                 return False
             return True
         candidates = [s for s in self.sources if allowed(s)]
@@ -259,12 +263,12 @@ class LiftPlannerV1P5:
             # Determine which source stacks can safely receive offloaded items.
             def safe_drop_target(s: 'StackState') -> bool:
                 # Cannot offload to full stacks or onto a remaining target. Mode B additionally
-                # avoids dropping on cleared satellites.
+                # avoids stacks that hide cleared satellites near the surface.
                 if s.space_left() <= 0:
                     return False
                 if self._is_remaining_target(s.top()):
                     return False
-                if self._mode_B_active and s.top() and s.top().cleared:
+                if self._mode_B_active and self._has_cleared_near_surface(s, self.hand_capacity):
                     return False
                 return True
 
