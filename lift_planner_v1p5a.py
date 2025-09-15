@@ -191,8 +191,7 @@ class LiftPlannerV1P5:
         lowest expected number of lifts.
         """
         cost = 1.0
-        depth = max(self.near_surface_depth, batch_size, 1)
-        if self._has_cleared_near_surface(stack, depth):
+        if self._has_cleared_near_surface(stack, max(batch_size, 1)):
             cost += 2.0
         return cost
 
