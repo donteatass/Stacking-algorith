@@ -672,7 +672,7 @@ class LiftPlannerV1P5:
                 raise AssertionError("Unified mode: must drop all lifted sats in a single drop.")
         # Original safety checks
         assert 1 <= k <= len(self.hand), "Drop exceeds hand content."
-        batch_top_to_bottom = self.hand[-k:][::-1]
+        batch_top_to_bottom = self.hand[-k:]
         if stack is not self.dest:
             assert len(stack.items) + k <= stack.cap, f"Drop would exceed cap of {stack.name}"
             if stack is not self.temp and self._is_remaining_target(stack.top()):
