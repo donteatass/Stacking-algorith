@@ -172,6 +172,24 @@ class LiftPlannerV1P5:
         """Return True if any cleared sat occurs within the top `depth` items."""
         return any(s.cleared for s in stack.items[:depth])
 
+    def _estimate_offload_cost(self, stack: 'StackState', batch_size: int) -> float:
+        """Estimate the total lifts required if `batch_size` blockers were dropped onto `stack`.
+
+        The cost model is intentionally simple:
+        * Dropping to any stack costs one lift.
+        * If the stack conceals a cleared satellite within the region that would be
+          covered by the offload, assume we will pay two extra lifts later to move
+          those blockers again.  This approximates the round-trip to TEMP.
+
+        This heuristic is used in both Mode A and Mode B to choose between TEMP and
+        candidate stacks so that the planner favours the destination with the
+        lowest expected number of lifts.
+        """
+        cost = 1.0
+        if self._has_cleared_near_surface(stack, max(batch_size, 1)):
+            cost += 2.0
+        return cost
+
     # --- Heuristics for temp returns ---
     def _score_offload_stack(self, stack: 'StackState', batch_size: int):
         """
@@ -247,28 +265,43 @@ class LiftPlannerV1P5:
             # Cannot drop onto a remaining target
             if self._is_remaining_target(s.top()):
                 return False
-            # In Mode B, avoid stacks that hide cleared sats near the surface
-            if self._mode_B_active and self._has_cleared_near_surface(s, max(batch_size, 1)):
+            # In Mode B, avoid dropping onto a cleared top altogether
+            if self._mode_B_active and s.top() and s.top().cleared:
                 return False
             return True
         candidates = [s for s in self.sources if allowed(s)]
         if not candidates:
             return None
-        # Choose the candidate with the lowest score according to _score_offload_stack
-        candidates.sort(key=lambda s: self._score_offload_stack(s, batch_size))
-        return candidates[0]
+
+        # Evaluate cost for each candidate and compare against the cost of using TEMP.
+        best_stack = None
+        best_cost = float('inf')
+        best_score = float('inf')
+        for s in candidates:
+            cost = self._estimate_offload_cost(s, batch_size)
+            # Break ties using the existing score heuristic
+            score = self._score_offload_stack(s, batch_size)
+            if cost < best_cost or (cost == best_cost and score < best_score):
+                best_cost = cost
+                best_score = score
+                best_stack = s
+
+        cost_temp = 2.0  # dropping to TEMP now and returning later
+        if best_cost < cost_temp:
+            return best_stack
+        return None
 
     def _ensure_temp_space(self, needed: int):
         while self.temp.space_left() < needed:
             # Determine which source stacks can safely receive offloaded items.
             def safe_drop_target(s: 'StackState') -> bool:
-                # Cannot offload to full stacks or onto a remaining target. Mode B additionally
-                # avoids stacks that hide cleared satellites near the surface.
+                # Cannot offload to full stacks or onto a remaining target.  In Mode B
+                # we also avoid dropping onto a cleared top because _drop would reject it.
                 if s.space_left() <= 0:
                     return False
                 if self._is_remaining_target(s.top()):
                     return False
-                if self._mode_B_active and self._has_cleared_near_surface(s, self.hand_capacity):
+                if self._mode_B_active and s.top() and s.top().cleared:
                     return False
                 return True
 
@@ -291,9 +324,15 @@ class LiftPlannerV1P5:
                 self._drop(self.dest, 1, note="Clear top target to DEST")
                 continue
 
-            # Select the best stack to offload into based on scoring
-            safe.sort(key=lambda s: self._score_offload_stack(s,
-                                                             min(self.hand_capacity, len(self.temp.items), s.space_left())))
+            # Select the best stack using the offload cost heuristic (ties broken by score)
+            def candidate_key(s: 'StackState'):
+                batch = min(self.hand_capacity, len(self.temp.items), s.space_left())
+                return (
+                    self._estimate_offload_cost(s, batch),
+                    self._score_offload_stack(s, batch),
+                )
+
+            safe.sort(key=candidate_key)
             target_stack = safe[0]
             move_n = min(self.hand_capacity, len(self.temp.items), target_stack.space_left())
             if move_n == 0:
@@ -313,15 +352,22 @@ class LiftPlannerV1P5:
             self.just_dropped_to_temp = False
             return
         if len(self.temp.items) >= self.early_temp_threshold:
-            best = None
             best_stack = None
+            best_cost = float('inf')
+            best_score = float('inf')
             for s in self.sources:
-                if s.space_left() <= 0: continue
-                if self._is_remaining_target(s.top()): continue
-                if self._mode_B_active and s.top() and s.top().cleared: continue
-                score = self._score_offload_stack(s, min(self.hand_capacity, len(self.temp.items), s.space_left()))
-                if best is None or score < best:
-                    best = score
+                if s.space_left() <= 0:
+                    continue
+                if self._is_remaining_target(s.top()):
+                    continue
+                if self._mode_B_active and s.top() and s.top().cleared:
+                    continue
+                batch = min(self.hand_capacity, len(self.temp.items), s.space_left())
+                cost = self._estimate_offload_cost(s, batch)
+                score = self._score_offload_stack(s, batch)
+                if cost < best_cost or (cost == best_cost and score < best_score):
+                    best_cost = cost
+                    best_score = score
                     best_stack = s
             if best_stack:
                 move_n = min(self.hand_capacity, len(self.temp.items), best_stack.space_left())
@@ -611,14 +657,23 @@ class LiftPlannerV1P5:
 
     def return_all_temp(self):
         while len(self.temp.items) > 0:
-            best = None; best_stack=None
+            best_stack = None
+            best_cost = float('inf')
+            best_score = float('inf')
             for s in self.sources:
-                if s.space_left() <= 0: continue
-                if self._is_remaining_target(s.top()): continue
-                if self._mode_B_active and s.top() and s.top().cleared: continue
-                score = self._score_offload_stack(s, min(self.hand_capacity, len(self.temp.items), s.space_left()))
-                if best is None or score < best:
-                    best = score; best_stack = s
+                if s.space_left() <= 0:
+                    continue
+                if self._is_remaining_target(s.top()):
+                    continue
+                if self._mode_B_active and s.top() and s.top().cleared:
+                    continue
+                batch = min(self.hand_capacity, len(self.temp.items), s.space_left())
+                cost = self._estimate_offload_cost(s, batch)
+                score = self._score_offload_stack(s, batch)
+                if cost < best_cost or (cost == best_cost and score < best_score):
+                    best_cost = cost
+                    best_score = score
+                    best_stack = s
             if not best_stack:
                 cand = [s for s in self.sources if s.space_left() > 0]
                 if not cand:
