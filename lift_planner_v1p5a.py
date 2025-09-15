@@ -60,7 +60,8 @@ class StackState:
 class LiftPlannerV1P5:
     def __init__(self, source_stacks: List[StackState], temp_stack: StackState, dest_stack: StackState,
                  hand_capacity: int = 7, temp_cap: int = 15, target_ids: Optional[Set[str]] = None,
-                 lookahead_depth: int = 2, beam_width: int = 3, early_temp_threshold: int = 12):
+                 lookahead_depth: int = 2, beam_width: int = 3, early_temp_threshold: int = 12,
+                 near_surface_depth: int = 5):
         self.sources = source_stacks
         self.temp = temp_stack
         self.dest = dest_stack
@@ -73,6 +74,10 @@ class LiftPlannerV1P5:
         self.lookahead_depth = lookahead_depth
         self.beam_width = beam_width
         self.early_temp_threshold = early_temp_threshold
+        # How deep to look for cleared sats when deciding if a stack is a risky offload site.
+        # A cleared satellite within this top region incurs a penalty in the cost heuristic,
+        # steering blockers toward TEMP instead of burying near-surface targets.
+        self.near_surface_depth = near_surface_depth
         self._mode_B_active = False
         # Track the step number of the most recent drop to TEMP.  This is used to avoid
         # immediately offloading items that have just been stashed into TEMP in the same
