@@ -82,6 +82,14 @@ class LiftPlannerV1P5:
         # TEMP.  This avoids the pathological case where items are returned to TEMP
         # and immediately offloaded back to a source in the same extraction sequence.
         self.just_dropped_to_temp: bool = False
+        # Track the stack currently being excavated in Mode A so that the early
+        # TEMP-return heuristic does not immediately re-bury the same stack.
+        self._active_excavation_stack: Optional[StackState] = None
+        # Maintain a set of stacks whose blockers are currently stashed in TEMP.
+        # Early TEMP returns should avoid these stacks while they still contain
+        # remaining targets, even if we have temporarily switched to excavating
+        # other stacks.
+        self._protected_temp_sources: Set[str] = set()
 
     def clone(self):
         return copy.deepcopy(self)
@@ -245,6 +253,16 @@ class LiftPlannerV1P5:
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1]
 
+    def _cleanup_protected_temp_sources(self) -> None:
+        """Drop stacks from the protected set once their targets are exhausted."""
+        if not self._protected_temp_sources:
+            return
+        active: Set[str] = set()
+        for stack in self.sources:
+            if stack.name in self._protected_temp_sources and self._stack_has_any_remaining_target(stack):
+                active.add(stack.name)
+        self._protected_temp_sources = active
+
     def _ensure_temp_space(self, needed: int):
         while self.temp.space_left() < needed:
             # Determine which source stacks can safely receive offloaded items.
@@ -299,6 +317,7 @@ class LiftPlannerV1P5:
             # Reset the flag and skip early temp return
             self.just_dropped_to_temp = False
             return
+        self._cleanup_protected_temp_sources()
         if len(self.temp.items) >= self.early_temp_threshold:
             best = None
             best_stack = None
@@ -306,6 +325,12 @@ class LiftPlannerV1P5:
                 if s.space_left() <= 0: continue
                 if self._is_remaining_target(s.top()): continue
                 if self._mode_B_active and s.top() and s.top().cleared: continue
+                if not self._mode_B_active:
+                    has_remaining = self._stack_has_any_remaining_target(s)
+                    if has_remaining and self._active_excavation_stack is s:
+                        continue
+                    if has_remaining and s.name in self._protected_temp_sources:
+                        continue
                 score = self._score_offload_stack(s, min(self.hand_capacity, len(self.temp.items), s.space_left()))
                 if best is None or score < best:
                     best = score
@@ -448,6 +473,8 @@ class LiftPlannerV1P5:
         deeper run yields a lower cost per target.  It preserves the unified
         single‑pick/single‑drop constraint used throughout the planner.
         """
+        self._active_excavation_stack = None
+        self._protected_temp_sources.clear()
         if not self.target_ids:
             raise AssertionError("Mode A requires target_ids to be provided.")
         # Verify that all targets exist in the source stacks
@@ -544,6 +571,7 @@ class LiftPlannerV1P5:
                 # Deliver the contiguous top run of targets from the best stack
                 take = min(best_top_run, self.hand_capacity, remaining)
                 # Note: we use _pick and _drop directly to enforce unified single pick/drop
+                self._active_excavation_stack = best_top_stack
                 self._pick(best_top_stack, take, note=f"Mode A unified: pick {take} target(s) from top")
                 self._drop(self.dest, take, note=f"Mode A unified: deliver {take} target(s) to DEST")
                 # Update delivered count automatically via dest stack
@@ -564,6 +592,7 @@ class LiftPlannerV1P5:
                         self._ensure_temp_space(chunk)
                     offload = self.temp
                 # Pick and offload blockers/targets from the chosen stack
+                self._active_excavation_stack = stack_c
                 self._pick(stack_c, chunk, note="Mode A unified: peel blockers")
                 self._drop(offload, chunk, note=f"Mode A unified: offload to {offload.name}")
                 self.maybe_early_temp_return()
@@ -595,6 +624,8 @@ class LiftPlannerV1P5:
             self._extract_one_from_stack(stack)
         # After all targets delivered, return items from TEMP to sources
         self.return_all_temp()
+        self._active_excavation_stack = None
+        self._protected_temp_sources.clear()
 
     def return_all_temp(self):
         while len(self.temp.items) > 0:
@@ -672,6 +703,20 @@ class LiftPlannerV1P5:
             self._lift_in_progress = False
         if stack is self.temp:
             self.just_dropped_to_temp = True
+            if (
+                not self._mode_B_active
+                and self._active_excavation_stack
+                and self._active_excavation_stack is not self.temp
+            ):
+                self._protected_temp_sources.add(self._active_excavation_stack.name)
+        elif stack is self.dest:
+            if (
+                not self._mode_B_active
+                and self._active_excavation_stack
+                and self._active_excavation_stack is not self.temp
+                and not self._stack_has_any_remaining_target(self._active_excavation_stack)
+            ):
+                self._protected_temp_sources.discard(self._active_excavation_stack.name)
 
     def _extract_one_from_stack(self, stack: 'StackState') -> bool:
         """Unified override for Mode A: one pick and one drop per lift."""
@@ -679,6 +724,7 @@ class LiftPlannerV1P5:
         top_run = self._contiguous_top_remaining_targets(stack)
         if top_run > 0:
             take = min(top_run, self.hand_capacity)
+            self._active_excavation_stack = stack
             self._pick(stack, take, note=f"Pick {take} target(s) from top (unified)")
             self._drop(self.dest, take, note=f"Deliver {take} target(s) to DEST (unified)")
             self.maybe_early_temp_return()
@@ -697,6 +743,7 @@ class LiftPlannerV1P5:
             if self.temp.space_left() < chunk:
                 self._ensure_temp_space(chunk)
             offload = self.temp
+        self._active_excavation_stack = stack
         self._pick(stack, chunk, note="Peel blockers (unified)")
         self._drop(offload, chunk, note=f"Offload blockers to {offload.name} (unified)")
         self.maybe_early_temp_return()
