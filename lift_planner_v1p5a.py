@@ -4,6 +4,7 @@ import pandas as pd
 import copy
 from pathlib import Path
 import math
+from sqlalchemy.engine import Engine
 
 @dataclass
 class Sat:
@@ -912,6 +913,33 @@ def read_stack_csv(path: Path, name: str) -> StackState:
     # Set stack capacity to accommodate the initial number of items or the default of 15, whichever is larger.
     # This prevents capacity-related errors when returning blockers to the source stack for datasets
     # that have more than 15 satellites in a location.
+    cap_size = max(15, len(items))
+    return StackState(name=name, items=items, cap=cap_size)
+
+
+def read_stack_sql(engine: Engine, table_name: str, name: str) -> StackState:
+    """Read stack data from an SQL table using a SQLAlchemy engine."""
+    df = pd.read_sql_table(table_name, con=engine)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if 'sat' not in df.columns:
+        if 'sat_id' in df.columns:
+            df['sat'] = df['sat_id']
+        else:
+            raise ValueError(f"Table {table_name} missing required column 'sat' or 'sat_id'")
+    for c in ["filled", "interim", "final", "issue"]:
+        if c not in df.columns:
+            raise ValueError(f"Table {table_name} missing required column '{c}'")
+    drop_cols = [c for c in df.columns if c.startswith('unnamed')]
+    df = df.drop(columns=drop_cols, errors='ignore')
+    items: List[Sat] = []
+    for _, row in df.iterrows():
+        items.append(Sat(
+            sat=str(row["sat"]),
+            filled=_parse_bool(row["filled"]),
+            interim=_parse_bool(row["interim"]),
+            final=_parse_bool(row["final"]),
+            issue=_parse_bool(row["issue"]),
+        ))
     cap_size = max(15, len(items))
     return StackState(name=name, items=items, cap=cap_size)
 
