@@ -217,15 +217,18 @@ class LiftPlannerV1P5:
         score_primary = has_any * 50 + depth_pen + cleared_pen
         return (score_primary, -space, -len(stack.items))
 
-    def _choose_offload_stack(self, batch_size: int, exclude: Optional['StackState']=None) -> Optional['StackState']:
+    def _choose_offload_stack(self, batch_size: int, exclude: Optional['StackState']=None,
+                               allow_temp: bool = True) -> Optional['StackState']:
         """
         Choose an offload destination for a batch of blockers.  Candidate stacks include
         all sources (subject to capacity and top-target checks) as well as TEMP when it
-        has sufficient space.  The stack with the lowest heuristic score is returned.
+        has sufficient space (if ``allow_temp`` is True).  The stack with the lowest
+        heuristic score is returned.
 
         Args:
             batch_size: Number of blockers to offload.
             exclude: A stack to exclude from consideration.
+            allow_temp: When False, TEMP is not considered as a destination.
 
         Returns:
             The chosen StackState, or None if no valid offload site exists.
@@ -244,7 +247,7 @@ class LiftPlannerV1P5:
             if allowed(s):
                 candidates.append((self._score_offload_stack(s, batch_size), s))
 
-        if self.temp.space_left() >= batch_size:
+        if allow_temp and self.temp.space_left() >= batch_size:
             candidates.append(((120, 0, 0), self.temp))
 
         if not candidates:
@@ -607,14 +610,28 @@ class LiftPlannerV1P5:
                     self.maybe_early_temp_return()
                     continue
                 if len(self.temp.items) > 0:
-                    offload_site = self._choose_offload_stack(min(self.hand_capacity, len(self.temp.items)))
-                    if offload_site is not None:
-                        move_n = min(self.hand_capacity, len(self.temp.items), offload_site.space_left())
-                        if move_n > 0:
-                            self._pick(self.temp, move_n, note="Unwind TEMP to recover candidates")
-                            self._drop(offload_site, move_n, note="Unwind TEMP (to enable Mode A candidates)")
-                            self.maybe_early_temp_return()
-                            continue
+                    remaining = self._remaining_targets()
+                    blockers_prefix = 0
+                    for sat in self.temp.items:
+                        if sat.sat in remaining:
+                            break
+                        blockers_prefix += 1
+                    desired_move = min(blockers_prefix, self.hand_capacity)
+                    if desired_move == 0:
+                        desired_move = min(self.hand_capacity, len(self.temp.items))
+                    move_n = desired_move
+                    chosen_site: Optional[StackState] = None
+                    while move_n > 0:
+                        candidate = self._choose_offload_stack(move_n, allow_temp=False)
+                        if candidate is not None:
+                            chosen_site = candidate
+                            break
+                        move_n -= 1
+                    if chosen_site is not None and move_n > 0:
+                        self._pick(self.temp, move_n, note="Unwind TEMP blockers (minimal exposure)")
+                        self._drop(chosen_site, move_n, note=f"Unwind TEMP blockers to {chosen_site.name}")
+                        self.maybe_early_temp_return()
+                        continue
 # Fallback: no large run candidates and no top run; use the original heuristics
             # Fall back to beam search when deeper look‑ahead cannot find a candidate
             if not self._remaining_targets():
