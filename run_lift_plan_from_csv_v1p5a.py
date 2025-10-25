@@ -1,7 +1,6 @@
 
 import argparse, json
 from pathlib import Path
-import pandas as pd
 from lift_planner_v1p5a import read_stack_csv, LiftPlannerV1P5, StackState
 
 def build_planner(csvs, lookahead, beam, early_temp):
